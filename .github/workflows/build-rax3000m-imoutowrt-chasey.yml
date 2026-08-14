@@ -239,7 +239,7 @@ jobs:
         echo "账号：root" >> release.txt
         echo "密码：无" >> release.txt
         echo "默认主题：Argon" >> release.txt
-        echo "集成插件：nikki wol samba4 upnp hd_idle argon_config" >> release.txt
+        echo "集成插件：nikki wol samba4 upnp hd_idle argon_config docker hysteria tailscale" >> release.txt
         echo "编译源码：[点此处查看](https://github.com/chasey-dev/immortalwrt-mt798x-rebase)" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
