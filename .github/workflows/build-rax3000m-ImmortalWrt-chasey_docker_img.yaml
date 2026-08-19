@@ -1,4 +1,4 @@
-name: Build RAX3000M ImmortalWrt in Docker (With Caches & DL)
+name: Build RAX3000M ImmortalWrt (Docker Version)
 
 on:
   workflow_call:
@@ -25,9 +25,10 @@ env:
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: rax3000m/immortalwrt-chasey/rax3000m-imoutowrt.config
   DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: rax3000m/immortalwrt-chasey/diy-part2-rax3000m.sh
+  DIY_P2_SH: rax3000m/immortalwrt-chasey/diy-part2-rax3000m_docker.sh
+  UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
-  UPLOAD_DOCKER_IMAGE: true    # 是否导出并上传离线 Docker 镜像
+  UPLOAD_DOCKER_IMAGE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   FILE_NAME: CMCC-rax3000m-ImmortalWrt
@@ -61,43 +62,63 @@ jobs:
             git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
             libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
             mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pip libpython3-dev qemu-utils \
-            rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev time gn sudo
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev time gn sudo \
+            libfuse-dev libfuse2
           
           useradd -m -s /bin/bash builduser
           echo 'builduser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
           chown -R builduser:builduser /workspace
         "
 
+    - name: Check server performance
+      run: |
+        echo "CPU Core Count: $(nproc)"
+        df -Th
+
     - name: Clone source code & Setup feeds
       run: |
         docker exec -u builduser ${{ env.DOCKER_CONTAINER_NAME }} bash -c "
           git clone --depth 1 ${{ env.REPO_URL }} -b ${{ env.REPO_BRANCH }} openwrt
           [ -e ${{ env.FEEDS_CONF }} ] && mv ${{ env.FEEDS_CONF }} openwrt/feeds.conf.default
-          chmod +x ${{ env.DIY_P1_SH }}
-          ./${{ env.DIY_P1_SH }}
           
+          # 执行 DIY 脚本 1
+          if [ -f \"${{ env.DIY_P1_SH }}\" ]; then
+            chmod +x ${{ env.DIY_P1_SH }}
+            ./${{ env.DIY_P1_SH }}
+          fi
+          
+          # 更新并安装 Feeds
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+        "
+
+    - name: Load custom configuration & Run DIY Part 2
+      run: |
+        docker exec -u builduser ${{ env.DOCKER_CONTAINER_NAME }} bash -c "
+          cd /workspace/openwrt
           
-          cd /workspace
-          [ -e files ] && mv files openwrt/files
-          [ -e ${{ env.CONFIG_FILE }} ] && mv ${{ env.CONFIG_FILE }} openwrt/.config
-          chmod +x ${{ env.DIY_P2_SH }}
-          ./${{ env.DIY_P2_SH }}
+          # 移动配置文件与自定义文件
+          [ -d \"/workspace/files\" ] && mv /workspace/files .
+          [ -f \"/workspace/${{ env.CONFIG_FILE }}\" ] && mv /workspace/${{ env.CONFIG_FILE }} .config
+          
+          # 切换进 openwrt 根目录内部执行 DIY Docker 脚本
+          if [ -f \"/workspace/${{ env.DIY_P2_SH }}\" ]; then
+            chmod +x /workspace/${{ env.DIY_P2_SH }}
+            /workspace/${{ env.DIY_P2_SH }}
+          fi
         "
 
     - name: SSH into Actions
       uses: mxschmitt/action-tmate@v3
       if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
 
-    - name: Pre-download Packages & Compile
+    - name: Download package & Compile
       id: compile
       run: |
         docker exec -u builduser ${{ env.DOCKER_CONTAINER_NAME }} bash -c "
-          cd openwrt
+          cd /workspace/openwrt
           make defconfig
-          # 提前完整下载所有源码包及依赖 (国内最容易被墙的部分)
           make download -j8
           find dl -size -1024c -exec rm -f {} \;
           
@@ -110,11 +131,9 @@ jobs:
         [ -n "$DEVICE_NAME" ] && echo "DEVICE_NAME=_$DEVICE_NAME" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Clean up Temp Files (Keep dl, feeds & sources for Offline Build)
+    - name: Clean up Build Dir (Keep dl & feeds for offline usage)
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
-        # 针对离线环境保留：dl 目录 (包源码)、feeds 目录 (拓展包)、.config
-        # 仅删除体积极其庞大且可由本地重新生成的编译中间产物 (build_dir 和 staging_dir)
         docker exec -u builduser ${{ env.DOCKER_CONTAINER_NAME }} bash -c "
           cd /workspace/openwrt
           rm -rf build_dir staging_dir
@@ -122,19 +141,18 @@ jobs:
         # 清理 Linux apt 系统的临时安装包
         docker exec ${{ env.DOCKER_CONTAINER_NAME }} bash -c "apt-get clean && rm -rf /var/lib/apt/lists/*"
 
-    - name: Export and Compress Offline Docker Image
+    - name: Export and Compress Docker Image
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
         mkdir -p $GITHUB_WORKSPACE/docker_export
         docker stop ${{ env.DOCKER_CONTAINER_NAME }}
         
         # 提交当前带源码和依赖的完整环境镜像
-        docker commit ${{ env.DOCKER_CONTAINER_NAME }} openwrt-offline-builder:latest
+        docker commit ${{ env.DOCKER_CONTAINER_NAME }} openwrt-builder-env:latest
         
         # 打包导出镜像文件
-        IMAGE_NAME="openwrt-offline-env${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}.tar.gz"
-        echo "正在导出离线 Docker 镜像 (含 dl 源码包与 feeds)..."
-        docker save openwrt-offline-builder:latest | gzip > $GITHUB_WORKSPACE/docker_export/$IMAGE_NAME
+        IMAGE_NAME="openwrt-builder-env${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}.tar.gz"
+        docker save openwrt-builder-env:latest | gzip > $GITHUB_WORKSPACE/docker_export/$IMAGE_NAME
         
         echo "DOCKER_IMAGE_PATH=$GITHUB_WORKSPACE/docker_export/$IMAGE_NAME" >> $GITHUB_ENV
 
@@ -148,17 +166,25 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> ${GITHUB_OUTPUT}
 
-    - name: Upload Offline Docker Image to Release
+    - name: Upload firmware & Docker Image to Release
       uses: softprops/action-gh-release@v2
       if: steps.compile.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: $(date +"%Y.%m.%d-%H%M-immortalwrt-6.12-offline-env")
+        tag_name: $(date +"%Y.%m.%d-%H%M-immortalwrt-6.12-rax3000m")
         body: |
-          ### 离线编译 Docker 镜像说明
-          - **内含资源**：全套编译依赖工具链、完整 `dl` 依赖包、`feeds` 拓展包及已配置好的 `.config` 文件。
-          - **国内使用**：导入此镜像后无需再连接外网下载依赖，直接执行 `make` 即可二次编译！
+          ### RAX3000M ImmortalWrt 固件与离线 Docker 镜像
+          - **后台 IP**：192.168.2.1
+          - **用户名**：root
+          - **密码**：无
+          - **包含 Docker 离线镜像**：镜像内已打入编译好的 `dl` 源码包、`feeds` 和配置，方便国内离线直接编译。
         files: |
           ${{ env.FIRMWARE }}/*
           ${{ env.DOCKER_IMAGE_PATH }}
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
