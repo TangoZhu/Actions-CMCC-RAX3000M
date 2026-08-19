@@ -3,7 +3,7 @@ name: Check for Upstream Release
 on:
   workflow_dispatch: # 允许你手动触发测试
   schedule:
-     # 每小时检查一次
+     # 每天北京时间 16:00 (UTC 08:00) 自动运行
      - cron: '0 8 * * *'
 
 # ‼️ 在这里填入上游仓库的 "所有者/仓库名"
@@ -77,7 +77,7 @@ jobs:
     if: needs.check.outputs.run_job == 'true'
     
     # 假设你的目标 YML 叫 my-build.yml
-    uses: ./.github/workflows/build-rax3000m-imoutowrt-chasey.yml 
+    uses: ./.github/workflows/build-rax3000m-ImmortalWrt-chasey.yml 
     with:
       upstream_tag: ${{ needs.check.outputs.latest_tag }}
     secrets: inherit

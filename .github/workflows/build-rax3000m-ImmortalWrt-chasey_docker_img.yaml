@@ -141,7 +141,7 @@ jobs:
         # 清理 Linux apt 系统的临时安装包
         docker exec ${{ env.DOCKER_CONTAINER_NAME }} bash -c "apt-get clean && rm -rf /var/lib/apt/lists/*"
 
-    - name: Export and Compress Docker Image
+    - name: Export and Compress Docker Image (Split 1.5G per file)
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
         mkdir -p $GITHUB_WORKSPACE/docker_export
@@ -150,11 +150,10 @@ jobs:
         # 提交当前带源码和依赖的完整环境镜像
         docker commit ${{ env.DOCKER_CONTAINER_NAME }} openwrt-builder-env:latest
         
-        # 打包导出镜像文件
-        IMAGE_NAME="openwrt-builder-env${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}.tar.gz"
-        docker save openwrt-builder-env:latest | gzip > $GITHUB_WORKSPACE/docker_export/$IMAGE_NAME
+        # 将 Docker 镜像导出并通过 gzip 压缩，按 1500M 自动切片分卷
+        docker save openwrt-builder-env:latest | gzip | split -b 1500m - $GITHUB_WORKSPACE/docker_export/openwrt-env.tar.gz.part_
         
-        echo "DOCKER_IMAGE_PATH=$GITHUB_WORKSPACE/docker_export/$IMAGE_NAME" >> $GITHUB_ENV
+        echo "DOCKER_IMAGE_PATH=$GITHUB_WORKSPACE/docker_export/openwrt-env.tar.gz.part_*" >> $GITHUB_ENV
 
     - name: Organize Firmware files
       id: organize
@@ -166,19 +165,26 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> ${GITHUB_OUTPUT}
 
+    - name: Generate release tag
+      id: tag
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt-6.12-rax3000m")" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload firmware & Docker Image to Release
       uses: softprops/action-gh-release@v2
-      if: steps.compile.outputs.status == 'success' && !cancelled()
+      if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: $(date +"%Y.%m.%d-%H%M-immortalwrt-6.12-rax3000m")
+        tag_name: ${{ steps.tag.outputs.release_tag }}
         body: |
           ### RAX3000M ImmortalWrt 固件与离线 Docker 镜像
           - **后台 IP**：192.168.2.1
           - **用户名**：root
           - **密码**：无
-          - **包含 Docker 离线镜像**：镜像内已打入编译好的 `dl` 源码包、`feeds` 和配置，方便国内离线直接编译。
+          - **Docker 镜像说明**：包含全套 `dl` 依赖源码包，下载所有 `part_*` 分卷后，在本地执行 `cat openwrt-env.tar.gz.part_* | docker load` 即可还原导入。
         files: |
           ${{ env.FIRMWARE }}/*
           ${{ env.DOCKER_IMAGE_PATH }}
