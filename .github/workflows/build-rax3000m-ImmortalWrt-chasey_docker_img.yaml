@@ -144,6 +144,9 @@ jobs:
     - name: Export and Compress Docker Image (Split 1.5G per file)
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
+        # 修复关键点：把工作区文件权限重新还给宿主机的 runner 账号，防止报错 Permission denied
+        sudo chown -R $USER:$USER $GITHUB_WORKSPACE
+
         mkdir -p $GITHUB_WORKSPACE/docker_export
         docker stop ${{ env.DOCKER_CONTAINER_NAME }}
         
