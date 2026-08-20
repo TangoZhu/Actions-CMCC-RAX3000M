@@ -144,20 +144,24 @@ jobs:
     - name: Export and Compress Docker Image (Split 1.5G per file)
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
-        # 恢复宿主 runner 用户对工作区的完全属主权限
+        # 1. 恢复宿主 runner 权限
         sudo chown -R $USER:$USER $GITHUB_WORKSPACE
-
-        cd $GITHUB_WORKSPACE
-        mkdir -p $GITHUB_WORKSPACE/docker_export
-        docker stop ${{ env.DOCKER_CONTAINER_NAME }}
         
-        # 提交当前带源码和依赖的完整环境镜像
+        cd $GITHUB_WORKSPACE
+        mkdir -p docker_export
+        
+        # 2. 将挂载卷里的 openwrt 完整项目（包含 dl）复制到容器原生根目录（/root/openwrt）下
+        echo "正在将 openwrt 源码和 dl 依赖导入 Docker 镜像层..."
+        docker exec ${{ env.DOCKER_CONTAINER_NAME }} cp -r /workspace/openwrt /root/openwrt
+        
+        # 3. 停止容器并提交（此时 /root/openwrt 会被持久化写入镜像）
+        docker stop ${{ env.DOCKER_CONTAINER_NAME }}
         docker commit ${{ env.DOCKER_CONTAINER_NAME }} openwrt-builder-env:latest
         
-        # 将 Docker 镜像导出并通过 gzip 压缩，按 1500M 自动切片分卷
+        # 4. 导出并按 1500M 切片
         docker save openwrt-builder-env:latest | gzip | split -b 1500m - docker_export/openwrt-env.tar.gz.part_
         
-        # 打印文件列表供日志打印排查
+        # 5. 打印导出的完整分卷列表
         ls -lh docker_export/
 
     - name: Organize Firmware files
@@ -189,7 +193,7 @@ jobs:
           - **后台 IP**：192.168.2.1
           - **用户名**：root
           - **密码**：无
-          - **Docker 镜像说明**：包含全套 `dl` 依赖源码包，下载所有 `part_*` 分卷后，在本地执行 `cat openwrt-env.tar.gz.part_* | docker load` 即可还原导入。
+          - **Docker 镜像说明**：项目源码与 `dl` 依赖存放在容器内的 `/root/openwrt` 目录。下载所有 `part_*` 分卷后，在本地执行 `cat openwrt-env.tar.gz.part_* | docker load` 即可还原导入。
         files: |
           ${{ env.FIRMWARE }}/*
           ${{ github.workspace }}/docker_export/openwrt-env.tar.gz.part_*
