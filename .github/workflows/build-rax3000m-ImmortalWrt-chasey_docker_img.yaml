@@ -144,9 +144,10 @@ jobs:
     - name: Export and Compress Docker Image (Split 1.5G per file)
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
-        # 修复关键点：把工作区文件权限重新还给宿主机的 runner 账号，防止报错 Permission denied
+        # 恢复宿主 runner 用户对工作区的完全属主权限
         sudo chown -R $USER:$USER $GITHUB_WORKSPACE
 
+        cd $GITHUB_WORKSPACE
         mkdir -p $GITHUB_WORKSPACE/docker_export
         docker stop ${{ env.DOCKER_CONTAINER_NAME }}
         
@@ -154,9 +155,10 @@ jobs:
         docker commit ${{ env.DOCKER_CONTAINER_NAME }} openwrt-builder-env:latest
         
         # 将 Docker 镜像导出并通过 gzip 压缩，按 1500M 自动切片分卷
-        docker save openwrt-builder-env:latest | gzip | split -b 1500m - $GITHUB_WORKSPACE/docker_export/openwrt-env.tar.gz.part_
+        docker save openwrt-builder-env:latest | gzip | split -b 1500m - docker_export/openwrt-env.tar.gz.part_
         
-        echo "DOCKER_IMAGE_PATH=$GITHUB_WORKSPACE/docker_export/openwrt-env.tar.gz.part_*" >> $GITHUB_ENV
+        # 打印文件列表供日志打印排查
+        ls -lh docker_export/
 
     - name: Organize Firmware files
       id: organize
@@ -190,7 +192,7 @@ jobs:
           - **Docker 镜像说明**：包含全套 `dl` 依赖源码包，下载所有 `part_*` 分卷后，在本地执行 `cat openwrt-env.tar.gz.part_* | docker load` 即可还原导入。
         files: |
           ${{ env.FIRMWARE }}/*
-          ${{ env.DOCKER_IMAGE_PATH }}
+          ${{ github.workspace }}/docker_export/openwrt-env.tar.gz.part_*
 
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@main
