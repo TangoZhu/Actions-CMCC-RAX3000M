@@ -1,4 +1,4 @@
-name: Build RAX3000M ImmortalWrt (Docker Version)
+name: Build RAX3000M ImmortalWrt && Docker Image
 
 on:
   workflow_call:
@@ -33,8 +33,9 @@ env:
   FILE_NAME: CMCC-rax3000m-ImmortalWrt
   PRODUCT_NAME: CMCC-rax3000m-ImmortalWrt
 
-  DOCKER_CONTAINER_NAME: openwrt_builder
-  DOCKER_IMAGE_NAME: openwrt-builder-env
+  DOCKER_CONTAINER_NAME: immortalwrt_builder
+  DOCKER_IMAGE_NAME: immortalwrt-builder-img
+  DOCKER_ARCHIVE_NAME: immortalwrt_builder  # 统一离线包与镜像导入变量名
 
   BUILD_ROOT: /home/builduser
   BUILD_USER: builduser
@@ -271,10 +272,10 @@ jobs:
         set -o pipefail
         docker export "${DOCKER_CONTAINER_NAME}" | \
           pigz -p "$(nproc)" | \
-          split -b 1500m - "$EXPORT_DIR/openwrt-env.tar.gz.part_"
+          split -b 1500m - "$EXPORT_DIR/${DOCKER_ARCHIVE_NAME}.tar.gz.part_"
 
         # 产物体检：空输入的 gzip 正好是 20 字节，必须挡住
-        TOTAL=$(cat "$EXPORT_DIR"/openwrt-env.tar.gz.part_* | wc -c)
+        TOTAL=$(cat "$EXPORT_DIR"/${DOCKER_ARCHIVE_NAME}.tar.gz.part_* | wc -c)
         echo "分卷总大小: $TOTAL 字节"
         if [ "$TOTAL" -lt 104857600 ]; then
           echo "::error::导出产物异常，总大小仅 $TOTAL 字节（磁盘不足导致 docker save 无输出）"
@@ -282,7 +283,7 @@ jobs:
           exit 1
         fi
 
-        ( cd "$EXPORT_DIR" && sha256sum openwrt-env.tar.gz.part_* > SHA256SUMS.txt )
+        ( cd "$EXPORT_DIR" && sha256sum ${DOCKER_ARCHIVE_NAME}.tar.gz.part_* > SHA256SUMS.txt )
         ls -lh "$EXPORT_DIR/"
 
     - name: Generate release tag
@@ -316,15 +317,15 @@ jobs:
           sha256sum -c SHA256SUMS.txt
 
           # 2. 解压并导入镜像（配置默认环境变量与启动命令）
-          cat openwrt-env.tar.gz.part_* | docker import \
+          cat ${{ env.DOCKER_ARCHIVE_NAME }}.tar.gz.part_* | docker import \
             -c "ENV TZ=Asia/Shanghai" \
             -c "USER builduser" \
             -c "WORKDIR /home/builduser/openwrt" \
             -c 'CMD ["/bin/bash"]' \
-            - openwrt-builder-env:latest
+            - ${{ env.DOCKER_ARCHIVE_NAME }}:latest
 
           # 3. 运行容器
-          docker run -it --name owrt openwrt-builder-env:latest
+          docker run -it --name owrt ${{ env.DOCKER_ARCHIVE_NAME }}:latest
 
           # 4. 直接续编
           make -j$(nproc)
@@ -333,7 +334,7 @@ jobs:
           源码路径为 `/home/builduser/openwrt`，与 CI 构建路径**完全一致**，`staging_dir` 中的交叉编译工具链绝对路径依然有效。
         files: |
           ${{ env.FIRMWARE }}/*
-          /mnt/docker_export/openwrt-env.tar.gz.part_*
+          /mnt/docker_export/${{ env.DOCKER_ARCHIVE_NAME }}.tar.gz.part_*
           /mnt/docker_export/SHA256SUMS.txt
 
     - name: Delete workflow runs
