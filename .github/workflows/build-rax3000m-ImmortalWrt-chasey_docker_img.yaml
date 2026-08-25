@@ -36,13 +36,11 @@ env:
   DOCKER_CONTAINER_NAME: openwrt_builder
   DOCKER_IMAGE_NAME: openwrt-builder-env
 
-  # 关键改动：直接在容器自有目录里编译，不再用挂载卷。
-  # 本地 docker load 后路径与 CI 完全一致，避免 staging_dir 里的绝对路径失效。
   BUILD_ROOT: /home/builduser
   BUILD_USER: builduser
   BUILD_UID: '1000'
 
-  # 分卷输出目录。放在 /mnt（runner 的大盘）上，别占 / 分区。
+  # 分卷输出目录。放在 /mnt（runner 的大盘）上，不占 / 分区
   EXPORT_DIR: /mnt/docker_export
 
   # 镜像保留级别：
@@ -120,13 +118,6 @@ jobs:
         done
         EOS
 
-    # ------------------------------------------------------------------
-    # 建账号 + 全局 safe.directory。
-    # safe.directory 写进 /etc/gitconfig，会随镜像层持久化，
-    # 本地 load 后不管用哪个用户跑，git 都不会再报 dubious ownership。
-    # git 一旦失效 → SOURCE_DATE_EPOCH 取不到 → 版本号变成 "." → apk 报
-    # "package version is invalid"，同时 kernel 的 initramfs cpio 时间戳越界。
-    # ------------------------------------------------------------------
     - name: Create build user & harden git config
       run: |
         set -euo pipefail
@@ -251,13 +242,7 @@ jobs:
         docker exec "${DOCKER_CONTAINER_NAME}" bash -c "apt-get clean && rm -rf /var/lib/apt/lists/*"
         df -Th /
 
-    # ------------------------------------------------------------------
-    # 导出。相比旧版：
-    #   - 没有 cp -r，省掉一整份 40G 重复拷贝（源码本来就在容器自有层里）
-    #   - SOURCE_DATE_EPOCH 烤成 ENV，本地即使 .git 出问题也不会再算错版本号
-    #   - 全程 set -o pipefail，并在结尾校验产物大小
-    #     （旧版空的 docker save 会被 gzip 压成 20 字节，split 返回 0，CI 照样绿）
-    # ------------------------------------------------------------------
+    # 核心优化部分：docker export + pigz 并行压缩
     - name: Export and Compress Docker Image (Split 1.5G per file)
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
       run: |
@@ -268,29 +253,15 @@ jobs:
         EPOCH=$(docker exec -u "${BUILD_USER}" "${DOCKER_CONTAINER_NAME}" \
           bash -c "cd ${BUILD_ROOT}/openwrt && git log -1 --pretty=%ct")
         [ -n "$EPOCH" ] || { echo "::error::取不到 SOURCE_DATE_EPOCH"; exit 1; }
-        echo "烤入镜像的 SOURCE_DATE_EPOCH = $EPOCH"
+        echo "SOURCE_DATE_EPOCH = $EPOCH"
+
+        sudo apt-get update -qq && sudo apt-get install -y -qq pigz
 
         docker stop "${DOCKER_CONTAINER_NAME}"
 
-        docker commit \
-          -c "ENV SOURCE_DATE_EPOCH=$EPOCH" \
-          -c "ENV TZ=${TZ}" \
-          -c "USER ${BUILD_USER}" \
-          -c "WORKDIR ${BUILD_ROOT}/openwrt" \
-          -c 'CMD ["/bin/bash"]' \
-          "${DOCKER_CONTAINER_NAME}" "${DOCKER_IMAGE_NAME}:latest"
-
-        docker image inspect "${DOCKER_IMAGE_NAME}:latest" >/dev/null \
-          || { echo "::error::docker commit 失败，镜像不存在"; exit 1; }
-        docker images "${DOCKER_IMAGE_NAME}"
-
-        # commit 已把容器读写层复制成独立镜像层，容器本身成了冗余副本。
-        # 删掉它能立刻腾出与源码树等量的空间，供 docker save 落盘使用。
-        docker rm "${DOCKER_CONTAINER_NAME}"
-        df -Th / /mnt
-
         set -o pipefail
-        docker save "${DOCKER_IMAGE_NAME}:latest" | gzip | \
+        docker export "${DOCKER_CONTAINER_NAME}" | \
+          pigz -p "$(nproc)" | \
           split -b 1500m - "$EXPORT_DIR/openwrt-env.tar.gz.part_"
 
         # 产物体检：空输入的 gzip 正好是 20 字节，必须挡住
@@ -329,25 +300,28 @@ jobs:
 
           #### 离线编译镜像用法
 
-          镜像为 `linux/amd64`（基于 ubuntu:22.04），请在 x86_64 环境下使用；
-          Apple Silicon 等 ARM 机器需开启 QEMU 模拟，否则工具链二进制架构不匹配。
+          镜像为 `linux/amd64`（基于 ubuntu:22.04），请在 x86_64 环境下使用。
 
           ```bash
-          # 1. 校验分卷完整性（可选但强烈建议）
+          # 1. 校验分卷完整性
           sha256sum -c SHA256SUMS.txt
 
-          # 2. 合并并导入
-          cat openwrt-env.tar.gz.part_* | docker load
+          # 2. 解压并导入镜像（配置默认环境变量与启动命令）
+          cat openwrt-env.tar.gz.part_* | docker import \
+            -c "ENV TZ=Asia/Shanghai" \
+            -c "USER builduser" \
+            -c "WORKDIR /home/builduser/openwrt" \
+            -c 'CMD ["/bin/bash"]' \
+            - openwrt-builder-env:latest
 
-          # 3. 起容器（已自动进入源码目录、切换到 builduser、设好 SOURCE_DATE_EPOCH）
+          # 3. 运行容器
           docker run -it --name owrt openwrt-builder-env:latest
 
           # 4. 直接续编
           make -j$(nproc)
           ```
 
-          源码路径为 `/home/builduser/openwrt`，与 CI 构建时**完全一致**，
-          因此 `staging_dir` 里的绝对路径依然有效，无需重建工具链。
+          源码路径为 `/home/builduser/openwrt`，与 CI 构建路径**完全一致**，`staging_dir` 中的交叉编译工具链绝对路径依然有效。
         files: |
           ${{ env.FIRMWARE }}/*
           /mnt/docker_export/openwrt-env.tar.gz.part_*
