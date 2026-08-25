@@ -231,6 +231,15 @@ jobs:
         docker exec -i -u "${BUILD_USER}" -e BUILD_ROOT="${BUILD_ROOT}" -e KEEP_LEVEL="${KEEP_LEVEL}" \
           "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
         cd "$BUILD_ROOT/openwrt"
+        
+        # 1. 在 export 之前打入 Docker Makefile 补丁（固定 COMMIT 避免离线环境连接 GitHub 超时）
+        DOCKER_MAKEFILE="feeds/packages/utils/docker/Makefile"
+        if [ -f "$DOCKER_MAKEFILE" ]; then
+          echo "正在写入 Docker PKG_GIT_SHORT_COMMIT 补丁到容器..."
+          sed -i 's/PKG_GIT_SHORT_COMMIT:=.*/PKG_GIT_SHORT_COMMIT:=8900f1d/g' "$DOCKER_MAKEFILE"
+        fi
+
+        # 2. 根据 KEEP_LEVEL 清理构建树
         case "$KEEP_LEVEL" in
           full)      echo "保留全部编译产物" ;;
           toolchain) echo "保留工具链，删除 target 包产物"; rm -rf build_dir/target-* ;;
