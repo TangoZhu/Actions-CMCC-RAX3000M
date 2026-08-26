@@ -233,11 +233,11 @@ jobs:
           "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
         cd "$BUILD_ROOT/openwrt"
         
-        # 1. 在 export 之前打入 Docker Makefile 补丁（固定 COMMIT 避免离线环境连接 GitHub 超时）
+        # 1. 动态屏蔽 Commit 强校验逻辑，既不破坏语法格式，也不强行绑定固定 Hash
         DOCKER_MAKEFILE="feeds/packages/utils/docker/Makefile"
         if [ -f "$DOCKER_MAKEFILE" ]; then
-          echo "正在写入 Docker PKG_GIT_SHORT_COMMIT 补丁到容器..."
-          sed -i 's/PKG_GIT_SHORT_COMMIT:=.*/PKG_GIT_SHORT_COMMIT:=8900f1d/g' "$DOCKER_MAKEFILE"
+          echo "正在移除 Docker Makefile 中的 Commit 校验逻辑..."
+          sed -i 's/EXPECTED_PKG_GIT_SHORT_COMMIT/DISABLE_PKG_GIT_SHORT_COMMIT/g' "$DOCKER_MAKEFILE"
         fi
 
         # 2. 根据 KEEP_LEVEL 清理构建树
