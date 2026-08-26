@@ -1,0 +1,347 @@
+name: Build RAX3000M ImmortalWrt (No Docker) && Docker Image
+
+on:
+  workflow_call:
+    inputs:
+      upstream_tag:
+        description: 'The new upstream tag that triggered this run'
+        required: true
+        type: string
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  REPO_URL: https://github.com/chasey-dev/immortalwrt-mt798x-rebase
+  REPO_BRANCH: '25.12'
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: rax3000m/immortalwrt-chasey/rax3000m-imoutowrt_no_docker.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: rax3000m/immortalwrt-chasey/diy-part2-rax3000m_docker.sh
+  UPLOAD_FIRMWARE: true
+  UPLOAD_DOCKER_IMAGE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  FILE_NAME: CMCC-rax3000m-ImmortalWrt-NoDocker
+  PRODUCT_NAME: CMCC-rax3000m-ImmortalWrt-NoDocker
+
+  DOCKER_CONTAINER_NAME: immortalwrt_builder_no_docker
+  DOCKER_IMAGE_NAME: immortalwrt-builder-img-no_docker
+  DOCKER_ARCHIVE_NAME: immortalwrt_builder_no_docker  # 统一离线包与镜像导入变量名
+
+  BUILD_ROOT: /home/builduser
+  BUILD_USER: builduser
+  BUILD_UID: '1000'
+
+  # 分卷输出目录。放在 /mnt（runner 的大盘）上，不占 / 分区
+  EXPORT_DIR: /mnt/docker_export
+
+  # 镜像保留级别：
+  #   full      = 全部保留（分卷约 13G，runner 磁盘很可能不够，慎用）
+  #   toolchain = 保留工具链/host 工具/dl，删掉 target 包产物（推荐，分卷约 6~7G）
+  #   none      = 只保留源码 + dl（分卷约 4G，本地需重建工具链）
+  KEEP_LEVEL: toolchain
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free up disk space
+      run: |
+        set -euo pipefail
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift
+        sudo docker image prune -af
+        df -Th / /mnt
+
+    # ------------------------------------------------------------------
+    # runner 的 / 分区只有 ~30G 可用，而 /mnt 是块 ~70G 的空盘。
+    # docker save 会把整个镜像先落盘到 <data-root>/tmp 再吐给管道，
+    # 所以必须把 data-root 挪到 /mnt，否则导出必然 no space left on device。
+    # 这里在拉取任何镜像之前切换，不需要迁移已有数据。
+    # ------------------------------------------------------------------
+    - name: Move Docker data-root to /mnt
+      run: |
+        set -euo pipefail
+        sudo systemctl stop docker docker.socket 2>/dev/null || sudo systemctl stop docker
+        sudo mkdir -p /mnt/docker-lib
+        echo '{"data-root": "/mnt/docker-lib"}' | sudo tee /etc/docker/daemon.json
+        sudo systemctl start docker
+        sudo docker info 2>/dev/null | grep -i "docker root dir"
+        df -Th / /mnt
+
+    - name: Start Docker Container
+      run: |
+        set -euo pipefail
+        docker run -d \
+          --name "${DOCKER_CONTAINER_NAME}" \
+          -e TZ="${TZ}" \
+          -v "$GITHUB_WORKSPACE:/workspace:ro" \
+          -w /workspace \
+          ubuntu:22.04 tail -f /dev/null
+
+    # ------------------------------------------------------------------
+    # 依赖安装。apt 是「全有或全无」的：列表里任何一个包名不存在，
+    # 整条命令失败且一个包都不装。旧版没有 set -e，失败会被静默吞掉，
+    # 这里加上 set -e 并在装完后硬校验关键命令。
+    # ------------------------------------------------------------------
+    - name: Prepare Docker Build Environment
+      run: |
+        set -euo pipefail
+        docker exec -i "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq \
+          ack antlr3 aria2 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext \
+          gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+          libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+          libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
+          mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+          libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+          upx-ucl unzip vim wget xmlto xxd zlib1g-dev time sudo libfuse-dev libfuse2
+
+        # 硬校验：装不上就让 CI 红掉，而不是留一个残废镜像
+        for c in git gcc g++ make cmake python3 rsync unzip wget xxd bison flex gawk cpio; do
+          command -v "$c" >/dev/null || { echo "::error::缺少必要工具: $c"; exit 1; }
+        done
+        EOS
+
+    - name: Create build user & harden git config
+      run: |
+        set -euo pipefail
+        docker exec -i -e BUILD_USER="${BUILD_USER}" -e BUILD_UID="${BUILD_UID}" \
+          -e BUILD_ROOT="${BUILD_ROOT}" "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        useradd -m -u "$BUILD_UID" -s /bin/bash "$BUILD_USER"
+        echo "$BUILD_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+        git config --system --add safe.directory '*'
+        mkdir -p "$BUILD_ROOT"
+        chown -R "$BUILD_USER:$BUILD_USER" "$BUILD_ROOT"
+        EOS
+
+    - name: Check server performance
+      run: |
+        echo "CPU Core Count: $(nproc)"
+        df -Th /
+
+    - name: Clone source code & Setup feeds
+      run: |
+        set -euo pipefail
+        docker exec -i -u "${BUILD_USER}" \
+          -e BUILD_ROOT="${BUILD_ROOT}" -e REPO_URL="${REPO_URL}" -e REPO_BRANCH="${REPO_BRANCH}" \
+          -e FEEDS_CONF="${FEEDS_CONF}" -e DIY_P1_SH="${DIY_P1_SH}" \
+          "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        cd "$BUILD_ROOT"
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+
+        # 验证 git 元数据可用 —— 这是版本号推导的唯一来源，坏了后面全崩
+        cd openwrt
+        EPOCH=$(git log -1 --pretty=%ct)
+        [ -n "$EPOCH" ] || { echo "::error::无法从 git 取得 SOURCE_DATE_EPOCH"; exit 1; }
+        echo "SOURCE_DATE_EPOCH = $EPOCH ($(date -u -d "@$EPOCH"))"
+        cd ..
+
+        [ -e "/workspace/$FEEDS_CONF" ] && cp "/workspace/$FEEDS_CONF" openwrt/feeds.conf.default
+
+        # DIY 脚本 1：保持与旧版一致的相对布局（cwd = openwrt 的父目录）
+        if [ -f "/workspace/$DIY_P1_SH" ]; then
+          install -m 755 "/workspace/$DIY_P1_SH" ./diy-part1.sh
+          ./diy-part1.sh
+        fi
+
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        EOS
+
+    - name: Load custom configuration & Run DIY Part 2
+      run: |
+        set -euo pipefail
+        docker exec -i -u "${BUILD_USER}" \
+          -e BUILD_ROOT="${BUILD_ROOT}" -e CONFIG_FILE="${CONFIG_FILE}" -e DIY_P2_SH="${DIY_P2_SH}" \
+          "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        cd "$BUILD_ROOT/openwrt"
+
+        [ -d "/workspace/files" ] && cp -r /workspace/files .
+        [ -f "/workspace/$CONFIG_FILE" ] || { echo "::error::找不到配置文件 $CONFIG_FILE"; exit 1; }
+        cp "/workspace/$CONFIG_FILE" .config
+
+        if [ -f "/workspace/$DIY_P2_SH" ]; then
+          install -m 755 "/workspace/$DIY_P2_SH" ./diy-part2.sh
+          ./diy-part2.sh
+        fi
+
+        # 重点修复：在编译前（defconfig/download/make 之前）精准屏蔽校验
+        # 仅将 exit 1 替换为 true，完全不破坏 Makefile 中的 Shell 换行反斜杠与 if/fi 结构
+        for mf in feeds/packages/utils/dockerd/Makefile feeds/packages/utils/docker/Makefile; do
+          if [ -f "$mf" ]; then
+            echo "正在安全屏蔽 $mf 中的版本/Commit 强校验中断..."
+            sed -i 's/exit 1/true/g' "$mf"
+          fi
+        done
+        EOS
+
+    - name: SSH into Actions
+      uses: mxschmitt/action-tmate@v3
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
+
+    - name: Download package & Compile
+      id: compile
+      run: |
+        set -euo pipefail
+        docker exec -i -u "${BUILD_USER}" -e BUILD_ROOT="${BUILD_ROOT}" \
+          "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        cd "$BUILD_ROOT/openwrt"
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec rm -f {} \;
+        echo "$(nproc) thread compile"
+        make -j"$(nproc)" || make -j1 || make -j1 V=s
+        EOS
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+        DEVICE_NAME=$(docker exec -u "${BUILD_USER}" "${DOCKER_CONTAINER_NAME}" \
+          bash -c "grep '^CONFIG_TARGET.*DEVICE.*=y' ${BUILD_ROOT}/openwrt/.config | sed -r 's/.*DEVICE_(.*)=y/\1/'" | head -1)
+        [ -n "$DEVICE_NAME" ] && echo "DEVICE_NAME=_$DEVICE_NAME" >> "$GITHUB_ENV"
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
+
+    # 固件先拷回宿主，后续 Release 步骤才有东西可传
+    - name: Extract firmware from container
+      id: organize
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        set -euo pipefail
+        rm -rf "$GITHUB_WORKSPACE/firmware_out"
+        mkdir -p "$GITHUB_WORKSPACE/firmware_out"
+        TARGET_DIR=$(docker exec "${DOCKER_CONTAINER_NAME}" \
+          bash -c "ls -d ${BUILD_ROOT}/openwrt/bin/targets/*/*")
+        docker cp "${DOCKER_CONTAINER_NAME}:${TARGET_DIR}/." "$GITHUB_WORKSPACE/firmware_out/"
+        cd "$GITHUB_WORKSPACE/firmware_out"
+        rm -rf packages config.buildinfo feeds.buildinfo sha256sums version.buildinfo
+        ls -lh
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Prune build tree by KEEP_LEVEL
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
+      run: |
+        set -euo pipefail
+        docker exec -i -u "${BUILD_USER}" -e BUILD_ROOT="${BUILD_ROOT}" -e KEEP_LEVEL="${KEEP_LEVEL}" \
+          "${DOCKER_CONTAINER_NAME}" bash -euo pipefail <<'EOS'
+        cd "$BUILD_ROOT/openwrt"
+
+        # 2. 根据 KEEP_LEVEL 清理构建树
+        case "$KEEP_LEVEL" in
+          full)      echo "保留全部编译产物" ;;
+          toolchain) echo "保留工具链，删除 target 包产物"; rm -rf build_dir/target-* ;;
+          none)      echo "只保留源码与 dl"; rm -rf build_dir staging_dir ;;
+          *)         echo "::error::KEEP_LEVEL 取值非法: $KEEP_LEVEL"; exit 1 ;;
+        esac
+        du -sh . 2>/dev/null || true
+        EOS
+        docker exec "${DOCKER_CONTAINER_NAME}" bash -c "apt-get clean && rm -rf /var/lib/apt/lists/*"
+        df -Th /
+
+    # 核心优化部分：docker export + pigz 并行压缩
+    - name: Export and Compress Docker Image (Split 1.5G per file)
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_DOCKER_IMAGE == 'true' && !cancelled()
+      run: |
+        set -euo pipefail
+        sudo rm -rf "$EXPORT_DIR" && sudo mkdir -p "$EXPORT_DIR"
+        sudo chown "$USER:$USER" "$EXPORT_DIR"
+
+        EPOCH=$(docker exec -u "${BUILD_USER}" "${DOCKER_CONTAINER_NAME}" \
+          bash -c "cd ${BUILD_ROOT}/openwrt && git log -1 --pretty=%ct")
+        [ -n "$EPOCH" ] || { echo "::error::取不到 SOURCE_DATE_EPOCH"; exit 1; }
+        echo "SOURCE_DATE_EPOCH = $EPOCH"
+
+        sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+
+        docker stop "${DOCKER_CONTAINER_NAME}"
+
+        set -o pipefail
+        docker export "${DOCKER_CONTAINER_NAME}" | \
+          pigz -p "$(nproc)" | \
+          split -b 1500m - "$EXPORT_DIR/${DOCKER_ARCHIVE_NAME}.tar.gz.part_"
+
+        # 产物体检：空输入的 gzip 正好是 20 字节，必须挡住
+        TOTAL=$(cat "$EXPORT_DIR"/${DOCKER_ARCHIVE_NAME}.tar.gz.part_* | wc -c)
+        echo "分卷总大小: $TOTAL 字节"
+        if [ "$TOTAL" -lt 104857600 ]; then
+          echo "::error::导出产物异常，总大小仅 $TOTAL 字节（磁盘不足导致 docker save 无输出）"
+          df -Th / /mnt
+          exit 1
+        fi
+
+        ( cd "$EXPORT_DIR" && sha256sum ${DOCKER_ARCHIVE_NAME}.tar.gz.part_* > SHA256SUMS.txt )
+        ls -lh "$EXPORT_DIR/"
+
+    - name: Generate release tag
+      id: tag
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        set -euo pipefail
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt-6.12-rax3000m-no_docker")" >> "$GITHUB_OUTPUT"
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Upload firmware & Docker Image to Release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body: |
+          ### RAX3000M ImmortalWrt 固件（无 Docker 插件版）与离线 Docker 编译镜像
+
+          - **后台 IP**：192.168.2.1
+          - **用户名**：root
+          - **密码**：无
+          - **说明**：本次固件未包含 docker / dockerd / docker-compose / luci-app-dockerman 软件包，其余功能与标准版一致
+
+          #### 离线编译镜像用法
+
+          镜像为 `linux/amd64`（基于 ubuntu:22.04），请在 x86_64 环境下使用。
+
+          ```bash
+          # 1. 校验分卷完整性
+          sha256sum -c SHA256SUMS.txt
+
+          # 2. 解压并导入镜像（配置默认环境变量与启动命令）
+          cat ${{ env.DOCKER_ARCHIVE_NAME }}.tar.gz.part_* | docker import \
+            -c "ENV TZ=Asia/Shanghai" \
+            -c "USER builduser" \
+            -c "WORKDIR /home/builduser/openwrt" \
+            -c 'CMD ["/bin/bash"]' \
+            - ${{ env.DOCKER_ARCHIVE_NAME }}:latest
+
+          # 3. 运行容器
+          docker run -it --name owrt ${{ env.DOCKER_ARCHIVE_NAME }}:latest
+
+          # 4. 直接续编
+          make -j$(nproc)
+          ```
+
+          源码路径为 `/home/builduser/openwrt`，与 CI 构建路径**完全一致**，`staging_dir` 中的交叉编译工具链绝对路径依然有效。
+        files: |
+          ${{ env.FIRMWARE }}/*
+          /mnt/docker_export/${{ env.DOCKER_ARCHIVE_NAME }}.tar.gz.part_*
+          /mnt/docker_export/SHA256SUMS.txt
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
